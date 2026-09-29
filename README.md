@@ -82,6 +82,16 @@ These are present in real reports and are rarely used:
 steeply with B, so any comparison of flagged against unflagged residues that
 does not stratify on it will overstate the association substantially.
 
+## Contents
+
+- [The four traps](#the-four-traps)
+- [Fields nobody reads](#fields-nobody-reads)
+- [Install](#install)
+- [How to use it](#how-to-use-it)
+- [How to read the output](#how-to-read-the-output)
+- [Recipes](#recipes)
+- [Fetching](#fetching)
+
 ## Install
 
 ```bash
@@ -97,39 +107,179 @@ cd wwpdb-validation && pip install -e .
 
 `pandas` is optional and needed only for `to_dataframe`.
 
-## Usage
+## How to use it
 
-**One entry**
+### A first look at an entry
 
 ```python
 from wwpdb_validation import Report, fetch
 
 rep = Report(fetch("1onh"))
-print(rep.entry.pdb_id, rep.entry.resolution, rep.entry.r_free)
-
-for r in rep.residues(exclude_waters=True):
-    if r.is_rama_outlier:
-        print(r.chain, r.resnum, r.resname, r.rscc, r.ediam, r.owab)
+print(rep)
+# <Report 1ONH 1.38 A, density=yes>
 ```
 
-**Many entries, counting the exclusions instead of hiding them**
+The repr tells you the two things to check before anything else: the resolution,
+and whether density data exists at all. **If `density=NO`, stop.** That entry has
+geometry assessment only, and any density field you read will be `None`.
+
+```python
+rep.entry.pdb_id            # '1ONH'
+rep.entry.resolution        # 1.38
+rep.entry.r_work            # 0.164
+rep.entry.r_free            # 0.196
+rep.entry.clashscore        # 3.12
+rep.entry.deposition_date   # '2003-04-24'
+rep.entry.attempted_steps   # ['molprobity', 'eds', 'xtriage', ...]
+rep.entry.attrs             # all ~90 attributes, unmodified
+```
+
+### Walking the residues
+
+```python
+for r in rep.residues(exclude_waters=True):
+    if r.is_rama_outlier:
+        print(f"{r.chain} {r.resname}{r.resnum}{r.icode} "
+              f"RSCC={r.rscc} RSRZ={r.rsrz} EDIAm={r.ediam} B={r.owab}")
+```
+
+`residues()` returns one row per residue by default, collapsing alternate
+conformations to the highest-occupancy copy. Pass `collapse_altloc=False` if you
+want every conformer, `model=1` to pick one model, `exclude_waters=True` to drop
+solvent.
+
+### Straight to a table
+
+```python
+df = rep.to_dataframe(exclude_waters=True)
+df.shape                    # (368, 38)
+```
+
+Every attribute in the report becomes a column, numeric fields already
+converted. Nothing is renamed, so a column name in the DataFrame is the
+attribute name in the XML and you can look it up in the wwPDB schema.
+
+## How to read the output
+
+The report measures a structure along three separate axes. They answer different
+questions and are easy to conflate.
+
+### Axis 1: does the model agree with the map?
+
+| field | range | reading |
+|---|---|---|
+| `rscc` | 0 to 1 | Real-space correlation between the deposited model's density and the experimental map. Higher is better. Well-ordered protein at good resolution typically sits above 0.9. Below about 0.7 is conventionally poor. **Not corrected for resolution**, so a 3.2 Å structure will look worse than a 1.2 Å one for the same quality of modelling. |
+| `rsr` | ~0 upward | Real-space residual. Lower is better. Same caveat about resolution. |
+| `rsrz` | Z-score | `rsr` expressed relative to structures at comparable resolution. **This is the resolution-corrected one**, and `rsrz > 2` is the wwPDB outlier criterion. Prefer it to `rscc` when comparing across resolutions. |
+
+**What poor agreement does NOT tell you.** A low `rscc` means model and map
+disagree. That happens either because the density is weak or absent, so the
+atoms are not determined by the experiment, or because the density is perfectly
+good and the residue is modelled wrongly. **These measures cannot separate the
+two**, and the difference matters: the first case cannot be fixed by rebuilding,
+the second can.
+
+### Axis 2: is there density there at all?
+
+| field | range | reading |
+|---|---|---|
+| `EDIAm` | 0 to ~1 | Median EDIA across the residue's atoms. Assesses support for the **presence** of atoms rather than the fit of a model. Below about 0.4 is commonly read as unsupported. |
+| `OPIA` | 0 to 100 | Percentage of the residue's atoms with adequate density support. |
+| `NatomsEDS` | count | How many atoms entered the density calculation. A small number here means the rest of the residue was not assessed. |
+
+This is the axis that speaks to the question axis 1 cannot answer. If `rscc` is
+low **and** `EDIAm` is low, the atoms are probably not determined by the data. If
+`rscc` is low but `EDIAm` is high, there is density and the model is likely in
+the wrong place, which is the correctable case.
+
+### Axis 3: geometry
+
+| field | values | reading |
+|---|---|---|
+| `rama` | `Favored`, `Allowed`, `OUTLIER` | Backbone conformation against the Ramachandran distribution. |
+| `rota` | `Favored`, `Allowed`, `OUTLIER`, `""` | Side-chain rotamer. Empty for residues without rotamers. |
+| `phi`, `psi` | degrees | The actual torsions, so you can plot Ramachandran space directly. |
+| `n_clashes` | count | Atom-atom overlaps involving this residue. |
+| `worst_clash` | Å | Largest overlap, as a positive number. MolProbity treats 0.4 Å and above as a clash. |
+| `cis_peptide` | flag | Present when the preceding peptide bond is modelled cis. |
+
+### The covariate that confounds all of it
+
+| field | reading |
+|---|---|
+| `owab` | Occupancy-weighted average B factor for the residue. Mobility and disorder. |
+
+**Read this whenever you compare groups.** Poor model-to-density agreement rises
+steeply with B: in a sample of 646 X-ray entries, the rate among residues with no
+geometry flag rose from 1.9% in the third B decile to 20.5% in the highest. Any
+comparison of flagged against unflagged residues that does not stratify on `owab`
+will attribute to geometry what is actually mobility. In that same sample,
+standardising for B approximately halved every apparent effect.
+
+### Entry-level percentiles
+
+`rep.entry.attrs` contains many `absolute-percentile-*` and
+`relative-percentile-*` fields. These rank the entry against the archive, either
+overall or against structures at similar resolution. They describe **where the
+entry sits among its peers**, not whether it is correct. A structure in the 95th
+percentile for clashscore is unusual, not necessarily wrong.
+
+### Values that are absent
+
+Any field may be `None`, and `None` is not zero. A residue with `rscc is None`
+was not assessed against density; it is not a residue that fits badly. Filtering
+with `df.rscc < 0.7` silently drops those, which is usually what you want, but
+count them so you know how many you dropped.
+
+## Recipes
+
+**Count the exclusions instead of hiding them**
 
 ```python
 from wwpdb_validation import fetch_many
 
-usable = missing = no_density = 0
-for pdb_id, rep in fetch_many(["1onh", "4lzt", "3nir"], require_density=True):
+usable, no_report, no_density = [], [], []
+for pdb_id, rep in fetch_many(ids):
     if rep is None:
-        missing += 1            # inspect why, do not just skip
-        continue
-    usable += 1
+        no_report.append(pdb_id)
+    elif not rep.has_density:
+        no_density.append(pdb_id)
+    else:
+        usable.append(rep)
+
+print(f"{len(usable)} usable, {len(no_density)} without density, "
+      f"{len(no_report)} with no report")
 ```
 
-**Straight to a DataFrame**
+**Residues where the model disagrees with good density, the correctable case**
 
 ```python
-df = rep.to_dataframe(exclude_waters=True, model=1)
+df = rep.to_dataframe(exclude_waters=True)
+correctable = df[(df.rscc < 0.7) & (df.EDIAm > 0.6)]
 ```
+
+**Ramachandran plot from the report alone, no coordinates needed**
+
+```python
+import matplotlib.pyplot as plt
+df = rep.to_dataframe(exclude_waters=True).dropna(subset=["phi", "psi"])
+plt.scatter(df.phi, df.psi, s=4,
+            c=(df.rama == "OUTLIER").map({True: "red", False: "grey"}))
+plt.xlabel("phi (degrees)"); plt.ylabel("psi (degrees)")
+```
+
+**Compare a flag class against the rest, stratified by B**
+
+```python
+import pandas as pd
+df = rep.to_dataframe(exclude_waters=True).dropna(subset=["owab", "rscc"])
+df["Bdecile"] = pd.qcut(df.owab, 10, labels=False, duplicates="drop")
+df["poor"] = df.rscc < 0.7
+print(df.groupby(["Bdecile", df.rama == "OUTLIER"]).poor.mean().unstack())
+```
+
+Comparing the two columns **within** a decile is the comparison worth making.
+Comparing the overall means is the comparison that misleads.
 
 ## Fetching
 
